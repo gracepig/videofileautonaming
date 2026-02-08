@@ -7,17 +7,14 @@ import re
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from itertools import chain
 from pathlib import Path
 
 DEFAULT_EXTENSIONS = ("mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m4v")
 
-# Matches _NNmin_WIDTHxHEIGHT at the end of a stem (before extension)
 ALREADY_TAGGED_RE = re.compile(r"_\d+min_\d+x\d+$")
-
-# Matches existing Chinese duration like 120分钟 in the filename
 CHINESE_DURATION_RE = re.compile(r"\d+分钟")
-
-# Matches existing _WIDTHxHEIGHT at the end of a stem
 TRAILING_RESOLUTION_RE = re.compile(r"_(\d+x\d+)$")
 
 
@@ -30,8 +27,8 @@ def check_ffprobe() -> str:
     return path
 
 
-def get_resolution(ffprobe_path: str, filepath: Path) -> tuple[int, int] | None:
-    """Probe a video file and return (width, height), or None on failure."""
+def probe_video(ffprobe_path: str, filepath: Path) -> tuple[int, int, int] | None:
+    """Probe a video file and return (duration_min, width, height), or None on failure."""
     try:
         result = subprocess.run(
             [
@@ -39,33 +36,8 @@ def get_resolution(ffprobe_path: str, filepath: Path) -> tuple[int, int] | None:
                 "-v", "error",
                 "-select_streams", "v:0",
                 "-show_entries", "stream=width,height",
-                "-of", "csv=p=0",
-                str(filepath),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0:
-            return None
-        parts = result.stdout.strip().split(",")
-        if len(parts) != 2:
-            return None
-        width, height = int(parts[0]), int(parts[1])
-        return (width, height)
-    except (subprocess.TimeoutExpired, ValueError, OSError):
-        return None
-
-
-def get_duration(ffprobe_path: str, filepath: Path) -> int | None:
-    """Probe a video file and return duration in minutes (rounded), or None on failure."""
-    try:
-        result = subprocess.run(
-            [
-                ffprobe_path,
-                "-v", "error",
                 "-show_entries", "format=duration",
-                "-of", "csv=p=0",
+                "-of", "default=noprint_wrappers=1",
                 str(filepath),
             ],
             capture_output=True,
@@ -74,19 +46,36 @@ def get_duration(ffprobe_path: str, filepath: Path) -> int | None:
         )
         if result.returncode != 0:
             return None
-        seconds = float(result.stdout.strip())
-        return max(1, round(seconds / 60))
+        
+        lines = result.stdout.strip().split("\n")
+        values = {}
+        for line in lines:
+            if "=" in line:
+                key, val = line.split("=", 1)
+                values[key] = val
+        
+        width = int(values.get("width", 0))
+        height = int(values.get("height", 0))
+        seconds = float(values.get("duration", 0))
+        
+        if width <= 0 or height <= 0:
+            return None
+        
+        duration_min = max(1, round(seconds / 60))
+        return (duration_min, width, height)
     except (subprocess.TimeoutExpired, ValueError, OSError):
         return None
 
 
 def collect_video_files(folder: Path, extensions: tuple[str, ...]) -> list[Path]:
     """Recursively collect video files matching the given extensions."""
-    files = []
-    for ext in extensions:
-        files.extend(folder.rglob(f"*.{ext}"))
-        files.extend(folder.rglob(f"*.{ext.upper()}"))
-    # Deduplicate (case-insensitive filesystems may return same file for both patterns)
+    def gen():
+        for ext in extensions:
+            yield from folder.rglob(f"*.{ext}")
+            yield from folder.rglob(f"*.{ext.upper()}")
+    
+    files = list(gen())
+    
     seen: set[Path] = set()
     unique: list[Path] = []
     for f in files:
@@ -99,27 +88,22 @@ def collect_video_files(folder: Path, extensions: tuple[str, ...]) -> list[Path]
 
 
 def build_new_path(filepath: Path, duration_min: int, width: int, height: int) -> Path:
-    """Build a new path with duration and resolution.
-
-    - If stem contains N分钟, replace it with Nmin (actual duration).
-    - If stem ends with _WIDTHxHEIGHT, replace with actual resolution.
-    - Otherwise append _WIDTHxHEIGHT.
-    """
+    """Build a new path with duration and resolution."""
     stem = filepath.stem
-
-    # Replace Chinese duration (e.g. 120分钟 -> 56min)
+    
     stem = CHINESE_DURATION_RE.sub(f"{duration_min}min", stem)
-
-    # Handle resolution: replace trailing _WIDTHxHEIGHT or append
+    
     if TRAILING_RESOLUTION_RE.search(stem):
         stem = TRAILING_RESOLUTION_RE.sub(f"_{width}x{height}", stem)
     else:
         stem = f"{stem}_{width}x{height}"
-
+    
     return filepath.with_stem(stem)
 
 
 def main() -> None:
+    print("Video File Auto Renamer - Starting...")
+    
     parser = argparse.ArgumentParser(
         description="Rename video files to include duration and resolution (e.g. Movie_45min_1920x1080.mp4)"
     )
@@ -152,31 +136,29 @@ def main() -> None:
 
     print(f"Found {len(files)} video file(s). Probing duration and resolution...\n")
 
-    # Collect rename plan: (old_path, new_path, status)
-    plan: list[tuple[Path, Path | None, str]] = []
-
-    for filepath in files:
+    def probe_file(filepath: Path) -> tuple[Path, Path | None, str]:
         if ALREADY_TAGGED_RE.search(filepath.stem):
-            plan.append((filepath, None, "SKIP (already tagged)"))
-            continue
-        res = get_resolution(ffprobe_path, filepath)
-        if res is None:
-            plan.append((filepath, None, "SKIP (probe failed)"))
-            continue
-        width, height = res
-        duration = get_duration(ffprobe_path, filepath)
-        if duration is None:
-            plan.append((filepath, None, "SKIP (duration failed)"))
-            continue
-        new_path = build_new_path(filepath, duration, width, height)
+            return (filepath, None, "SKIP (already tagged)")
+        
+        probe_result = probe_video(ffprobe_path, filepath)
+        if probe_result is None:
+            return (filepath, None, "SKIP (probe failed)")
+        
+        duration_min, width, height = probe_result
+        new_path = build_new_path(filepath, duration_min, width, height)
+        
         if new_path == filepath:
-            plan.append((filepath, None, "SKIP (already named)"))
+            return (filepath, None, "SKIP (already named)")
         elif new_path.exists():
-            plan.append((filepath, new_path, "SKIP (target exists)"))
+            return (filepath, new_path, "SKIP (target exists)")
         else:
-            plan.append((filepath, new_path, "RENAME"))
+            return (filepath, new_path, "RENAME")
 
-    # Display preview table
+    with ThreadPoolExecutor() as executor:
+        results = list(executor.map(probe_file, files))
+
+    plan: list[tuple[Path, Path | None, str]] = sorted(results, key=lambda p: str(p[0]))
+
     rename_count = sum(1 for _, _, s in plan if s == "RENAME")
     skip_count = len(plan) - rename_count
 
@@ -194,7 +176,6 @@ def main() -> None:
         print("Add --apply to rename files.")
         return
 
-    # Apply renames
     print("\nApplying renames...\n")
     success = 0
     fail = 0
