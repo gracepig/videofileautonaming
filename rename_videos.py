@@ -2,12 +2,23 @@
 """Scan a video folder, detect duration and resolution via ffprobe, and rename files."""
 
 import argparse
+import os
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 DEFAULT_EXTENSIONS = ("mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m4v")
+
+# Matches _NNmin_WIDTHxHEIGHT at the end of a stem (before extension)
+ALREADY_TAGGED_RE = re.compile(r"_\d+min_\d+x\d+$")
+
+# Matches existing Chinese duration like 120分钟 in the filename
+CHINESE_DURATION_RE = re.compile(r"\d+分钟")
+
+# Matches existing _WIDTHxHEIGHT at the end of a stem
+TRAILING_RESOLUTION_RE = re.compile(r"_(\d+x\d+)$")
 
 
 def check_ffprobe() -> str:
@@ -88,9 +99,24 @@ def collect_video_files(folder: Path, extensions: tuple[str, ...]) -> list[Path]
 
 
 def build_new_path(filepath: Path, duration_min: int, width: int, height: int) -> Path:
-    """Build a new path with duration and resolution appended before the extension."""
-    tag = f"_{duration_min}min_{width}x{height}"
-    return filepath.with_stem(filepath.stem + tag)
+    """Build a new path with duration and resolution.
+
+    - If stem contains N分钟, replace it with Nmin (actual duration).
+    - If stem ends with _WIDTHxHEIGHT, replace with actual resolution.
+    - Otherwise append _WIDTHxHEIGHT.
+    """
+    stem = filepath.stem
+
+    # Replace Chinese duration (e.g. 120分钟 -> 56min)
+    stem = CHINESE_DURATION_RE.sub(f"{duration_min}min", stem)
+
+    # Handle resolution: replace trailing _WIDTHxHEIGHT or append
+    if TRAILING_RESOLUTION_RE.search(stem):
+        stem = TRAILING_RESOLUTION_RE.sub(f"_{width}x{height}", stem)
+    else:
+        stem = f"{stem}_{width}x{height}"
+
+    return filepath.with_stem(stem)
 
 
 def main() -> None:
@@ -130,6 +156,9 @@ def main() -> None:
     plan: list[tuple[Path, Path | None, str]] = []
 
     for filepath in files:
+        if ALREADY_TAGGED_RE.search(filepath.stem):
+            plan.append((filepath, None, "SKIP (already tagged)"))
+            continue
         res = get_resolution(ffprobe_path, filepath)
         if res is None:
             plan.append((filepath, None, "SKIP (probe failed)"))
@@ -173,7 +202,7 @@ def main() -> None:
         if status != "RENAME" or new_path is None:
             continue
         try:
-            old_path.rename(new_path)
+            os.rename(str(old_path), str(new_path))
             print(f"  OK  {old_path.name} -> {new_path.name}")
             success += 1
         except OSError as e:
