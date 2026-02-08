@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
 from pathlib import Path
@@ -102,6 +103,7 @@ def build_new_path(filepath: Path, duration_min: int, width: int, height: int) -
 
 
 def main() -> None:
+    start_time = time.time()
     print("Video File Auto Renamer - Starting...")
     
     parser = argparse.ArgumentParser(
@@ -171,6 +173,8 @@ def main() -> None:
     print("-" * 130)
     print(f"\nTotal: {len(plan)} | To rename: {rename_count} | Skipped: {skip_count}")
 
+    elapsed = time.time() - start_time
+    print(f"Total runtime: {elapsed:.2f} seconds")
     if not args.apply:
         print("\nDry-run mode. No files were renamed.")
         print("Add --apply to rename files.")
