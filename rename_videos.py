@@ -121,6 +121,11 @@ def main() -> None:
         default=list(DEFAULT_EXTENSIONS),
         help=f"Video extensions to process (default: {' '.join(DEFAULT_EXTENSIONS)})",
     )
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="Show progress bar during processing",
+    )
     args = parser.parse_args()
 
     folder: Path = args.folder.resolve()
@@ -156,8 +161,24 @@ def main() -> None:
         else:
             return (filepath, new_path, "RENAME")
 
-    with ThreadPoolExecutor() as executor:
-        results = list(executor.map(probe_file, files))
+    results = []
+    if args.progress:
+        print("Processing files...")
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(probe_file, f): f for f in files}
+            completed = 0
+            total = len(files)
+            for future in futures:
+                result = future.result()
+                results.append(result)
+                completed += 1
+                if completed % 10 == 0 or completed == total:
+                    pct = (completed / total) * 100
+                    print(f"  Progress: {completed}/{total} ({pct:.1f}%)", end="\r")
+            print()  # New line after progress
+    else:
+        with ThreadPoolExecutor() as executor:
+            results = list(executor.map(probe_file, files))
 
     plan: list[tuple[Path, Path | None, str]] = sorted(results, key=lambda p: str(p[0]))
 
