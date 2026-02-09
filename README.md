@@ -26,6 +26,8 @@ python3 rename_videos.py /path/to/video/folder
 python3 rename_videos.py /path/to/video/folder --apply
 
 # Specify custom extensions
+# Show progress bar
+python3 rename_videos.py /path/to/video/folder --progress
 python3 rename_videos.py /path/to/video/folder --ext mp4 mkv webm
 
 # Show help
